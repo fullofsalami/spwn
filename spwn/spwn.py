@@ -11,20 +11,21 @@ from spwn.scripter import Scripter
 from spwn.configmanager import ConfigManager
 from spwn.customanalyzer import CustomAnalyzer
 from spwn.configgenerator import ConfigGenerator
+from spwn import dockerretreivelibs
 
 
 CONFIG_PATH = os.path.expanduser("~/.config/spwn/config.json")
 
 
 class Spwn:
-	def __init__(self, create_interactions: bool, no_decompiler: bool, script_only: bool, interactions_only: bool):
+	def __init__(self, create_interactions: bool, no_decompiler: bool, script_only: bool, interactions_only: bool, use_docker:bool, force_docker:bool, rename_libc:bool):
 		if not interactions_only:
 			self.create_interactions = create_interactions or script_only
 			self.no_decompiler = no_decompiler
 			self.script_only = script_only
 			self.check_dependencies()
 			self.files = FileManager(configs)
-			self.files.auto_recognize(self.script_only)
+			self.files.auto_recognize(self.script_only, use_docker, force_docker, rename_libc)
 
 			print("[*] Binary:", self.files.binary.name)
 			if self.files.libc: print("[*] Libc:  ", self.files.libc.name)
@@ -188,6 +189,26 @@ def main():
 	)
 
 	parser.add_argument(
+		"--no_docker",
+		action="store_true",
+		default=False,
+		help="Setup configs and quit"
+	)
+	parser.add_argument(
+		"--force_docker",
+		action="store_true",
+		default=False,
+		help="Setup configs and quit"
+	)
+
+	parser.add_argument(
+		"--no_rename_libc",
+		action="store_false",
+		default=True,
+		help="Setup configs and quit"
+	)
+
+	parser.add_argument(
 		"others",
 		nargs=argparse.REMAINDER,
 		help="You can avoid typing the hyphens and/or specify the template"
@@ -221,4 +242,4 @@ def main():
 		template = others.pop() if others else None
 		configs = ConfigManager(CONFIG_PATH, template)
 
-		Spwn(create_interactions=args.inter, no_decompiler=args.nodecomp, script_only=args.sonly, interactions_only=args.ionly)
+		Spwn(create_interactions=args.inter, no_decompiler=args.nodecomp, script_only=args.sonly, interactions_only=args.ionly, use_docker=not args.no_docker, force_docker=args.force_docker, rename_libc=args.no_rename_libc)

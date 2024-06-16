@@ -2,6 +2,7 @@ import pwn
 import requests
 import os
 import subprocess
+import re
 
 
 def ask_list_delete(msg: str, options: list[str], can_skip: bool) -> str | None:
@@ -119,12 +120,12 @@ def find_and_extract_data(tempdir: str) -> bool:
 	return True
 
 
-def find_loader(tempdir: str) -> str | None:
+def find_loader(tempdir: str, version:str) -> str | None:
 	for parent, dirs, files in os.walk(tempdir):
 		for file in files:
-			if not file.startswith("ld-linux"): continue
+			if not file.startswith("ld-"): continue
 			file = os.path.join(parent, file)
-			if os.path.isfile(file) and pwn.platform.architecture(file)[1] == "ELF":
+			if os.path.isfile(file) and pwn.platform.architecture(file)[1] == "ELF" and version.encode() in pwn.ELF(file, checksec=False).get_section_by_name('.rodata').data():
 				return file
 
 	print("[!] Cannot find loader inside deb package")

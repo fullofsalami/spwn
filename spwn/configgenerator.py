@@ -4,8 +4,9 @@ import json
 
 
 default_configs = {
-	"debug_dir": "debug_dir",
-	"script_file": "a.py",
+	"debug_dir": "patched/",
+	"docker_extract_path": ".",
+	"script_file": "solve.py",
 	"pwn_process": "r",
 	"tab": "\t",
 	"template_file": "~/.config/spwn/template.py",
@@ -17,38 +18,42 @@ default_configs = {
 	"preanalysis_scripts": [],
 	"postanalysis_scripts": [],
 	"idafree_command": "",
-	"decompiler_command": ""
+	"decompiler_command": "~/binaryninja/binaryninja {binary}"
 }
 
 default_template = '''
+#!/usr/bin/env python3
+
 from pwn import *
 
-binary_name = "{binary}"
-exe  = ELF(binary_name, checksec=True)
-libc = ELF("{libc}", checksec=False)
+{bindings}
+
 context.binary = exe
 
-ru  = lambda *x, **y: r.recvuntil(*x, **y)
-rl  = lambda *x, **y: r.recvline(*x, **y)
-rc  = lambda *x, **y: r.recv(*x, **y)
-sla = lambda *x, **y: r.sendlineafter(*x, **y)
-sa  = lambda *x, **y: r.sendafter(*x, **y)
-sl  = lambda *x, **y: r.sendline(*x, **y)
-sn  = lambda *x, **y: r.send(*x, **y)
 
-if args.REMOTE:
-	r = connect("")
-elif args.GDB:
-	r = gdb.debug(f"{debug_dir}/{{binary_name}}", """
-		c
-	""", aslr=False)
-else:
-	r = process(f"{debug_dir}/{{binary_name}}")
+def conn():
+    if args.LOCAL:
+        r = exe.process()
+        if args.GDB:
+            gdb.attach(r)
+    else:
+        r = remote("addr", 1337)
 
-{interactions}
+    return r
 
 
-r.interactive()
+def main():
+    r = conn()
+    
+	{interactions}
+
+    # good luck pwning :)
+
+    r.interactive()
+
+
+if __name__ == "__main__":
+    main()
 '''[1:-1]
 
 

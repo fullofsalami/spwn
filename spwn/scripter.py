@@ -2,6 +2,8 @@ from spwn.filemanager import FileManager
 from spwn.configmanager import ConfigManager
 import spwn.utils as utils
 
+import os
+
 
 class Scripter:
 	def __init__(self, configs: ConfigManager, files: FileManager | None = None, create_interactions: bool = False):
@@ -13,6 +15,17 @@ class Scripter:
 			with open(self.configs.template_file) as f:
 				self.template = f.read()
 
+	def generate_bindings(self) -> None:
+		bindings = {'exe':self.files.binary.debug_name}
+
+		if self.files.libc:
+			bindings.update({'libc':self.files.libc.debug_name})
+		
+		if self.files.loader:
+			bindings.update({'ld':self.files.loader.debug_name})
+
+		self.flattend_bindings = '\n'.join([f'{binding} = ELF("{bindings[binding]}")' for binding in bindings])
+
 	def create_script(self) -> None:
 		if self.create_interactions:
 			if "{interactions}" not in self.template:
@@ -20,23 +33,14 @@ class Scripter:
 			else:
 				self.create_menu_interaction_functions()
 
-		if self.files.libc:
-			self.script = self.template.format(
-				binary=self.files.binary.name,
-				libc=self.files.libc.name,
-				debug_dir=self.configs.debug_dir,
-				interactions=self.interactions
-			)
+		self.generate_bindings()
 
-		else:
-			# Remove libc line from template
-			self.template = "\n".join(filter(lambda x: "{libc}" not in x, self.template.splitlines()))
-
-			self.script = self.template.format(
-				binary=self.files.binary.name,
-				debug_dir=".",
-				interactions=self.interactions
-			)
+		self.script = self.template.format(
+			bindings=self.flattend_bindings,
+			binary=self.files.binary.name,
+			debug_dir=self.configs.debug_dir,
+			interactions=self.interactions
+		)
 
 	def save_script(self) -> None:
 		with open(self.configs.script_file, "w") as f:

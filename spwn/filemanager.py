@@ -9,6 +9,7 @@ from spwn.binary import Binary
 from spwn.libc import Libc
 from spwn.loader import Loader
 from spwn.configmanager import ConfigManager
+from spwn.dockerretreivelibs import DockerAnalyzer
 
 
 class FileManager:
@@ -18,16 +19,27 @@ class FileManager:
 		self.libc = None
 		self.loader = None
 		self.other_binaries = []
+		self.docker_analyzer = DockerAnalyzer(configs)
 
-	def auto_recognize(self, maybe_has_debug: bool) -> None:
+	def auto_recognize(self, maybe_has_debug: bool, use_docker:bool, force_docker:bool, rename_libc:bool) -> None:
 		binaries = []
 		libcs = []
 		loaders = []
-		other_libraries = []
+		docker_libc = None
+		other_libraries:list[str] = []
 		files = list(filter(lambda x: pwn.platform.architecture(x)[1] == "ELF", os.listdir()))
 		self.other_binaries = files
 		if not files:
 			raise Exception("No ELFs found")
+		
+		if use_docker:
+			docker_bin, docker_libc, docker_libs = self.docker_analyzer.get_dependencies()
+			if not force_docker:
+				binaries.append(f'docker: {docker_bin}')
+				libcs.append(f'docker: {docker_libc}')
+				other_libraries.extend([f'docker: {lib}' for lib in docker_libs])
+				for lib in docker_libs:
+					self.docker_analyzer.extract(lib)
 
 		for file in files:
 			if file.startswith("libc"):
@@ -40,32 +52,52 @@ class FileManager:
 				binaries.append(file)
 
 		# Binary
-		if len(binaries) == 1:
-			self.binary = Binary(binaries[0])
+		if force_docker and docker_bin is not None:
+			self.binary = docker_bin
+		elif len(binaries) == 1 or (docker_bin is not None and any(filter(lambda bin: docker_bin == bin, binaries[1:]))):
+			self.binary = binaries[0]
 		elif len(binaries) > 1:
 			self.binary = utils.ask_list_delete("Select binary", binaries, can_skip=False)
-			self.binary = Binary(self.binary)
-			other_libraries.extend(binaries)
 		else:
 			self.ask_all(files)
 			return
-		del files[files.index(self.binary.name)]
+		self.binary = Binary(self.binary.removeprefix('docker: '))
+		if self.binary.name in files:
+			del files[files.index(self.binary.name)]
 
 		# Libc
-		if len(libcs) == 1:
-			self.libc = Libc(libcs[0])
+		if force_docker and (docker_libc is not None):
+			libc_name = docker_libc
+		elif len(libcs) == 1:
+			libc_name = libcs[0]
 		else:
 			libcs.extend(other_libraries)
 			if not libcs:
 				return
 
-			self.libc = utils.ask_list_delete("Select libc", libcs, can_skip=True)
-			if self.libc is None:
-				return
-			self.libc = Libc(self.libc)
+			libc_name = utils.ask_list_delete("Select libc", libcs, can_skip=True)
 
+			if libc_name is None:
+				return
 			other_libraries = libcs
-		del files[files.index(self.libc.name)]
+		if 'docker: ' in libc_name:
+			libc_name = self.docker_analyzer.extract(docker_libc, is_tmp_file=rename_libc)
+			self.libc = Libc(libc_name)
+
+			if rename_libc:
+				new_name = f'{self.configs.docker_extract_path}/libc-{self.libc.version}.so'
+				old_name = self.libc.name
+				print(f'[*] renamed {docker_libc or self.libc.name} to {new_name}')
+				shutil.copyfile(old_name, new_name)
+				os.remove(old_name)
+				self.libc = Libc(new_name)
+				self.libc.debug_name = os.path.normpath(os.path.join(self.configs.debug_dir, docker_libc or self.libc.name))
+		else:
+			self.libc = Libc(libc_name)
+
+		
+		if self.libc.name in files:
+			del files[files.index(self.libc.name)]
 
 		if maybe_has_debug:
 			if os.path.exists(self.configs.debug_dir):
@@ -84,6 +116,10 @@ class FileManager:
 			if self.loader:
 				self.loader = Loader(self.loader)
 		del files[files.index(self.loader.name)]
+
+		for other_lib in other_libraries:
+			if 'docker:' in other_lib:
+				self.docker_analyzer.extract(other_lib.removeprefix('docker: '))
 
 	def ask_all(self, files: list[str]) -> None:
 		if not files: raise Exception("No executables found")
@@ -116,7 +152,7 @@ class FileManager:
 		package_url  = f"https://launchpad.net/ubuntu/+archive/primary/+files/{package_name}"
 		tempdir = tempfile.mkdtemp()
 
-		print("[+] Downloading loader")
+		print(f"[+] Downloading loader from {package_url}")
 		if not utils.download_package(package_url, tempdir):
 			shutil.rmtree(tempdir)
 			return
@@ -130,7 +166,7 @@ class FileManager:
 			shutil.rmtree(tempdir)
 			return
 
-		loader_path = utils.find_loader(tempdir)
+		loader_path = utils.find_loader(tempdir, ubuntu_version)
 		if loader_path is None:
 			shutil.rmtree(tempdir)
 			return
