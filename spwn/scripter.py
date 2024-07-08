@@ -24,6 +24,10 @@ class Scripter:
 		if self.files.loader:
 			bindings.update({'ld':self.files.loader.debug_name})
 
+		for filename, lib in self.files.other_libs.items():
+			name = filename.split('.')[0]
+			bindings.update({name:lib.debug_name})
+
 		self.flattend_bindings = '\n'.join([f'{binding} = ELF("{bindings[binding]}")' for binding in bindings])
 
 	def create_script(self) -> None:

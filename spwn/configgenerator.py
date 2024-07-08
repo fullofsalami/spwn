@@ -5,7 +5,7 @@ import json
 
 default_configs = {
 	"debug_dir": "patched/",
-	"docker_extract_path": ".",
+	"extract_dir":"./",
 	"script_file": "solve.py",
 	"pwn_process": "r",
 	"tab": "\t",

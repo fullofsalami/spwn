@@ -5,13 +5,13 @@ import sys
 
 sys.argv = ["NOTERM"] + sys.argv  # HACK to prevent pwntools to messup the terminal, the added arg will be removed by pwnlib
 
-from spwn.filemanager import FileManager
+# from spwn.filemanager import FileManager
 from spwn.analyzer import Analyzer
 from spwn.scripter import Scripter
 from spwn.configmanager import ConfigManager
 from spwn.customanalyzer import CustomAnalyzer
 from spwn.configgenerator import ConfigGenerator
-from spwn import dockerretreivelibs
+from spwn.filemanager import FileManager
 
 
 CONFIG_PATH = os.path.expanduser("~/.config/spwn/config.json")
@@ -24,15 +24,16 @@ class Spwn:
 			self.no_decompiler = no_decompiler
 			self.script_only = script_only
 			self.check_dependencies()
+
 			self.files = FileManager(configs)
-			self.files.auto_recognize(self.script_only, use_docker, force_docker, rename_libc)
+			self.files.auto_recognize()
 
 			print("[*] Binary:", self.files.binary.name)
 			if self.files.libc: print("[*] Libc:  ", self.files.libc.name)
 			else: print("[!] No libc")
 			if self.files.loader: print("[*] Loader:", self.files.loader.name)
 			else: print("[!] No loader")
-			if self.files.other_binaries: print("[*] Other: ", self.files.other_binaries)
+			if self.files.other_libs: print("[*] Other libs: ", [*self.files.other_libs.keys()])
 			print()
 		else:
 			self.files = None
@@ -53,8 +54,8 @@ class Spwn:
 					self.populate_debug_dir()
 					self.files.libc.maybe_unstrip()
 
-					if self.files.loader is None:
-						self.files.get_loader()
+					# if self.files.loader is None:
+					# 	self.files.get_loader()
 					if self.files.loader is not None:
 						self.files.loader.set_executable()
 
@@ -143,8 +144,9 @@ class Spwn:
 			shutil.copy(self.files.loader.name, os.path.join(configs.debug_dir, "ld-linux.so.2"))
 			self.files.loader.debug_name = os.path.join(configs.debug_dir, "ld-linux.so.2")
 
-		for binary in self.files.other_binaries:
-			shutil.copy(binary, os.path.join(configs.debug_dir, binary))
+		for name, lib in self.files.other_libs.items():
+			shutil.copy(lib.name, os.path.join(configs.debug_dir, lib))
+			lib.debug_name = os.path.join(configs.debug_dir, lib)
 
 
 def main():

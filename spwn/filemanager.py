@@ -1,191 +1,324 @@
-import pwn
-import shutil
+#!/usr/bin/env python3
+
 import os
-import tempfile
+import io
+import tarfile
+import re
+import shutil
 import subprocess
+import tempfile
+import platform
+
+from pwnlib.elf import ELF
 
 import spwn.utils as utils
 from spwn.binary import Binary
 from spwn.libc import Libc
+from spwn.lib import Lib
 from spwn.loader import Loader
 from spwn.configmanager import ConfigManager
-from spwn.dockerretreivelibs import DockerAnalyzer
 
+import docker
+import docker.errors
+from docker.client import DockerClient
+from docker.models.images import Image
+
+from elftools.elf.elffile import ELFFile
+from elftools.elf.dynamic import DynamicSection
 
 class FileManager:
-	def __init__(self, configs: ConfigManager):
-		self.configs = configs
-		self.binary = None
-		self.libc = None
-		self.loader = None
-		self.other_binaries = []
-		self.docker_analyzer = DockerAnalyzer(configs)
+    def __init__(self, configs:ConfigManager):
+        self.tars:dict[str, tuple[io.BytesIO, list[str]]] = {}
+        self.binary_name:str = None
+        self.binary:Binary = None
+        self.image:Image = None
+        self.client:DockerClient = None
+        self.libc:Libc = None
+        self.loader:Loader = None
+        self.other_libs:dict[str, Lib] = {}
+        self.configs = configs
+        self.version:str = None
+        self.arch:str = None
+        self.version_string:str = None
 
-	def auto_recognize(self, maybe_has_debug: bool, use_docker:bool, force_docker:bool, rename_libc:bool) -> None:
-		binaries = []
-		libcs = []
-		loaders = []
-		docker_libc = None
-		other_libraries:list[str] = []
-		files = list(filter(lambda x: pwn.platform.architecture(x)[1] == "ELF", os.listdir()))
-		self.other_binaries = files
-		if not files:
-			raise Exception("No ELFs found")
-		
-		if use_docker:
-			docker_bin, docker_libc, docker_libs = self.docker_analyzer.get_dependencies()
-			if not force_docker:
-				binaries.append(f'docker: {docker_bin}')
-				libcs.append(f'docker: {docker_libc}')
-				other_libraries.extend([f'docker: {lib}' for lib in docker_libs])
-				for lib in docker_libs:
-					self.docker_analyzer.extract(lib)
+    def find_binary(self) -> str:
 
-		for file in files:
-			if file.startswith("libc"):
-				libcs.append(file)
-			elif file.startswith("lib"):
-				other_libraries.append(file)
-			elif file.startswith("ld"):
-				loaders.append(file)
-			else:
-				binaries.append(file)
+        if self.image is None:
+            candidates = [candidate for candidate in os.listdir() if platform.architecture(candidate)[1] == "ELF" and not (candidate.startswith('lib') or candidate.startswith('ld-'))]
+            return utils.ask_list('Please chose the binary: ', candidates, False)
 
-		# Binary
-		if force_docker and docker_bin is not None:
-			self.binary = docker_bin
-		elif len(binaries) == 1 or (docker_bin is not None and any(filter(lambda bin: docker_bin == bin, binaries[1:]))):
-			self.binary = binaries[0]
-		elif len(binaries) > 1:
-			self.binary = utils.ask_list_delete("Select binary", binaries, can_skip=False)
-		else:
-			self.ask_all(files)
-			return
-		self.binary = Binary(self.binary.removeprefix('docker: '))
-		if self.binary.name in files:
-			del files[files.index(self.binary.name)]
+        entrys = ''.join(self.image.attrs['ContainerConfig']['Cmd'] + self.image.attrs['ContainerConfig']['Entrypoint'])
 
-		# Libc
-		if force_docker and (docker_libc is not None):
-			libc_name = docker_libc
-		elif len(libcs) == 1:
-			libc_name = libcs[0]
-		else:
-			libcs.extend(other_libraries)
-			if not libcs:
-				return
+        for file in os.listdir():
+            if file in entrys:
+                return file
 
-			libc_name = utils.ask_list_delete("Select libc", libcs, can_skip=True)
+        raise FileNotFoundError('No binary found in either CMD or Entrypoint')
 
-			if libc_name is None:
-				return
-			other_libraries = libcs
-		if 'docker: ' in libc_name:
-			libc_name = self.docker_analyzer.extract(docker_libc, is_tmp_file=rename_libc)
-			self.libc = Libc(libc_name)
+    def get_shared_libraries_and_paths(self, binary:str) -> tuple[list[str]]:
+        with open(binary, 'rb') as file:
+            elffile = ELFFile(file)
 
-			if rename_libc:
-				new_name = f'{self.configs.docker_extract_path}/libc-{self.libc.version}.so'
-				old_name = self.libc.name
-				print(f'[*] renamed {docker_libc or self.libc.name} to {new_name}')
-				shutil.copyfile(old_name, new_name)
-				os.remove(old_name)
-				self.libc = Libc(new_name)
-				self.libc.debug_name = os.path.normpath(os.path.join(self.configs.debug_dir, docker_libc or self.libc.name))
-		else:
-			self.libc = Libc(libc_name)
+            dynamic_section = None
+            interpreter = None
 
-		
-		if self.libc.name in files:
-			del files[files.index(self.libc.name)]
+            for section in elffile.iter_sections():
+                if isinstance(section, DynamicSection):
+                    dynamic_section = section
+                    break
 
-		if maybe_has_debug:
-			if os.path.exists(self.configs.debug_dir):
-				if os.path.exists(os.path.join(self.configs.debug_dir, self.binary.name)):
-					self.binary.debug_name = os.path.join(self.configs.debug_dir, self.binary.name)
-				if os.path.exists(os.path.join(self.configs.debug_dir, "libc.so.6")):
-					self.libc.debug_name = os.path.join(self.configs.debug_dir, self.libc.name)
+            if not dynamic_section:
+                raise Exception("No dynamic section found in the binary.")
 
-		# Loader
-		if len(loaders) == 1:
-			self.loader = Loader(loaders[0])
-		else:
-			if not loaders:
-				return
-			self.loader = utils.ask_list_delete("Select loader", loaders, can_skip=True)
-			if self.loader:
-				self.loader = Loader(self.loader)
-		del files[files.index(self.loader.name)]
+            for segment in elffile.iter_segments():
+                if segment.header.p_type == 'PT_INTERP':
+                    interpreter = segment.get_interp_name()
+                    break
 
-		for other_lib in other_libraries:
-			if 'docker:' in other_lib:
-				self.docker_analyzer.extract(other_lib.removeprefix('docker: '))
+            needed_libraries = []
+            rpath = []
+            runpath = []
+            ldlibpath = []
 
-	def ask_all(self, files: list[str]) -> None:
-		if not files: raise Exception("No executables found")
+            for tag in dynamic_section.iter_tags():
+                if tag.entry.d_tag == 'DT_NEEDED':
+                    needed_libraries.append(tag.needed)
+                elif tag.entry.d_tag == 'DT_RPATH':
+                    rpath = tag.rpath.split(':')
+                elif tag.entry.d_tag == 'DT_RUNPATH':
+                    runpath = tag.runpath.split(':')
 
-		self.libc = None
-		self.loader = None
+            if 'LD_LIBRARY_PATH' in os.environ:
+                ldlibpath = os.environ.get('LD_LIBRARY_PATH', '').split(':')
 
-		self.binary = utils.ask_list_delete("Select binary", files, can_skip=False)
-		self.binary = Binary(self.binary)
-		if files:
-			self.libc = utils.ask_list_delete("Select libc", files, can_skip=True)
-			if self.libc and files:
-				self.libc = Libc(self.libc)
-				self.loader = utils.ask_list_delete("Select loader", files, can_skip=True)
-				if self.loader:
-					self.loader = Loader(self.loader)
-			else:
-				self.loader = None
-		else:
-			self.libc = None
-			self.loader = None
+            # Combine rpath and runpath for search directories
+            search_dirs = rpath + runpath + ldlibpath + ['/lib/', '/usr/lib/', '/lib64/', '/usr/lib64/']
 
-	def get_loader(self) -> None:
-		ubuntu_version = self.libc.get_ubuntu_version_string()
-		if ubuntu_version is None:
-			print("[!] Cannot get ubuntu packet name for loader")
-			return
+            if interpreter:
+                needed_libraries.append(interpreter)
 
-		package_name = f"libc6_{ubuntu_version}_{self.libc.pwnfile.get_machine_arch()}.deb"
-		package_url  = f"https://launchpad.net/ubuntu/+archive/primary/+files/{package_name}"
-		tempdir = tempfile.mkdtemp()
+            return set(needed_libraries), search_dirs
+    def get_tar_from_path(self, path:str) -> io.BytesIO:
+        container = self.client.containers.create(self.image.id)
 
-		print(f"[+] Downloading loader from {package_url}")
-		if not utils.download_package(package_url, tempdir):
-			shutil.rmtree(tempdir)
-			return
+        try:        # Path to extract not found
+            stream, _ = container.get_archive(path)
+        except docker.errors.NotFound:
+            container.remove()
+            return None
 
-		print("[+] Extracting loader")
-		if not utils.extract_deb(tempdir):
-			shutil.rmtree(tempdir)
-			return
+        tar_object = io.BytesIO()
+        for chunk in stream:
+            tar_object.write(chunk)
+        tar_object.seek(0)
 
-		if not utils.find_and_extract_data(tempdir):
-			shutil.rmtree(tempdir)
-			return
+        container.remove()
 
-		loader_path = utils.find_loader(tempdir, ubuntu_version)
-		if loader_path is None:
-			shutil.rmtree(tempdir)
-			return
+        return tar_object
+    
+    def get_ubuntu_version_string(self, file:str) -> str | None:
+        with open(file, "rb") as f:
+            content = f.read()
+        match = re.search(r"\d+\.\d+-\d+ubuntu\d+(\.\d+)?".encode(), content)
 
-		new_loader_path = os.path.join(self.configs.debug_dir, "ld-linux.so.2")
-		shutil.copyfile(loader_path, new_loader_path)
-		self.loader = Loader(new_loader_path)
+        if match:
+            return match.group().decode()
+        else:
+            return None
+    
+    def get_libc_version(self, file_path:str):
+        return platform.libc_ver(file_path)[1], ELF(file_path, checksec=False).get_machine_arch(), self.get_ubuntu_version_string(file_path)
 
-		shutil.rmtree(tempdir)
-		return
+    def get_libc_version_buffer(self, tar_obj:io.BytesIO, file_name:str) -> str:
+        temp_file = tempfile.mkstemp()[1]
 
-	def patchelf(self) -> None:
-		if self.loader:
-			try:
-				subprocess.check_call(["patchelf", "--set-interpreter", f"./{self.loader.debug_name}", "--set-rpath", f"./{self.configs.debug_dir}", self.binary.debug_name])
-			except subprocess.CalledProcessError:
-				print("[!] patchelf failed")
-		else:
-			try:
-				subprocess.check_call(["patchelf", "--set-rpath", f"./{self.configs.debug_dir}", self.binary.debug_name])
-			except subprocess.CalledProcessError:
-				print("[!] patchelf failed")
+        tar_obj.seek(0)
+
+        with tarfile.open(fileobj=tar_obj) as tar:
+            tar._extract_member(tar.getmember(file_name), temp_file)
+
+        version, arch, version_string = self.get_libc_version(temp_file)
+
+        os.remove(temp_file)
+
+        print(f'[+] ubuntu version: {version}, arch: {arch}')
+
+        return version, arch, version_string
+
+    def build_container(self):
+        self.client = docker.from_env()
+
+        tag = os.path.basename(os.getcwd())
+
+        print(f'[*] building container with tag: {tag}')
+
+        self.image, build_logs = self.client.images.build(path='.', quiet=False, tag=tag)
+
+        for log in build_logs:
+            print(log.get('stream', ''), end='')
+
+    def populate_tars(self):
+        for path in self.search_dirs:
+            if not path in self.tars:
+                tar_object = self.get_tar_from_path(path)
+                if tar_object is None:      # Path to extract not found
+                    continue
+                with tarfile.open(fileobj=tar_object) as tar:
+                    self.tars.update({path:(tar_object, tar.getnames())})
+
+                tar_object.seek(0)
+
+    def extract_file(self, tar_object:io.BytesIO, tar_name:str, out_path:str):
+       
+        tar_object.seek(0)
+        with tarfile.open(fileobj=tar_object) as tar:
+            content = tar.extractfile(tar_name)
+
+            with open(out_path, 'wb') as f:
+                f.write(content.read())
+    
+    def auto_recognize(self,) -> tuple[list[str]]:
+        if 'Dockerfile' in os.listdir():
+            self.build_container()
+        else:
+            print('[-] No Dockerfile found in local directory.')
+
+        self.binary_name = self.find_binary()
+
+        print(f'[*] found binary: {self.binary_name}')
+
+        libs, self.search_dirs = self.get_shared_libraries_and_paths(self.binary_name)
+
+        if self.image is not None:
+            self.populate_tars()
+
+        self.libraries = {}
+
+        local_files = set(os.listdir())
+
+        def compare_file_names(name1:str, name2:str) -> bool:
+            m1, m2 = re.match(r'^(\S+?)[.-]', name1), re.match(r'^(\S+?)[.-]', name2)
+            res = m1 and m2 and m1.groups() == m2.groups()
+            return res
+
+        def search_local(libname):
+            for file in local_files:
+                if compare_file_names(os.path.basename(file), libname):
+                    if 'libc.' in file or 'libc-' in file:
+                        self.version, self.arch, self.version_string = self.get_libc_version(file)
+                    return {libname:(f'{libname} (local)', file)}
+            return None
+
+        def search_docker(libname):
+            for path, (tar_object, files) in self.tars.items():
+                for file in files:
+                    if compare_file_names(os.path.basename(file), libname):
+                        if 'libc.' in file or 'libc-' in file:
+                            self.version, self.arch, self.version_string = self.get_libc_version_buffer(tar_object, file)
+                            out_path = os.path.normpath(os.path.join(self.configs.extract_dir, f'libc-{self.version}.so'))
+                            self.extract_file(tar_object, file, out_path)
+                        else:
+                            out_path = os.path.normpath(os.path.join(self.configs.extract_dir, os.path.basename(file)))
+                            self.extract_file(tar_object, file, out_path)
+                        return {libname:(f'{libname} (docker)', out_path)}
+            return None
+
+        for lib in libs:
+            libname = os.path.basename(lib)
+            result = search_local(libname) or search_docker(libname)
+            if not result is None:
+                self.libraries.update(result)
+
+        missing_libs = [lib for lib in libs if not os.path.basename(lib) in self.libraries]
+
+        if self.version is not None and any(missing_libs):    # test if there are any unresolved dependencies
+            temp_dir = self.get_online(self.version_string, self.arch)
+            for lib in missing_libs:
+                lib_name = os.path.basename(lib)
+                for sdir in self.search_dirs:
+                    lib_path = os.path.normpath(os.path.join(temp_dir, sdir, lib_name))
+                    if os.path.exists(lib_path) and os.path.isfile(lib_path):
+                        file = os.path.normpath(os.path.join(self.configs.extract_dir, lib_name))
+                        shutil.copyfile(lib_path, file)
+                        self.libraries.update({lib_name:(f'{lib_name} (online)', file)})
+                        break
+                else:
+                    self.libraries.update({lib:(f'{lib_name} (not found)', None)})
+
+
+        print('[+] Dependencies:')
+        # print('\n'.join([f' - {desc}' for file, (desc, path) in self.libraries.items()]))
+
+        self.binary = Binary(self.binary_name)
+
+        for file, (desc, path) in self.libraries.items():
+            print(f' - {desc}')
+            if 'libc.' in file or 'libc-' in file:
+                self.libc = Libc(path)
+            elif str(file).startswith('ld'):
+                self.loader = Loader(path)
+            else:
+                self.other_libs.update({file:Lib(path)})
+            
+
+    def extract(self, member_name:str, is_tmp_file:bool=False) -> tuple[Binary, Libc,]:
+        for path in self.search_dirs:
+            if not path in self.tars:
+                tar_object = self.get_tar_from_path(path)
+                if tar_object is None:      # Path to extract not found
+                    continue
+                self.tars.update({path:tar_object})
+
+            with tarfile.open(fileobj=tar_object) as tar:
+                hits = [*filter(lambda member: member_name in member.name, tar.getmembers())]
+                if hits: 
+                    break
+        member = hits[0]
+        member_name = os.path.basename(member.name)
+        while member.issym():
+            member = tar.getmember(member.linkname)
+
+        if not is_tmp_file:
+            print(f'[*] extracting {member_name} to {self.configs.docker_extract_path}')
+
+        file_name = tempfile.mkstemp()[1] if is_tmp_file else os.path.join(self.configs.docker_extract_path, member_name)
+
+        tar._extract_member(member, file_name)
+
+        return file_name
+    
+    def get_online(self, version:str, arch:str) -> None:
+        package_name = f"libc6_{version}_{arch}.deb"
+        package_url  = f"https://launchpad.net/ubuntu/+archive/primary/+files/{package_name}"
+        tempdir = tempfile.mkdtemp()
+
+        print(f"[+] Downloading loader from {package_url}")
+        if not utils.download_package(package_url, tempdir):
+            shutil.rmtree(tempdir)
+            print('[-] Download failed')
+            return
+
+        print("[+] Extracting loader")
+        if not utils.extract_deb(tempdir):
+            print('[-] Extracting failed')
+            shutil.rmtree(tempdir)
+            return
+
+        if not utils.find_and_extract_data(tempdir):
+            print('[-] Extracting data failed')
+            shutil.rmtree(tempdir)
+            return
+        
+        return tempdir
+    
+    def patchelf(self) -> None:
+        if self.loader:
+            try:
+                subprocess.check_call(["patchelf", "--set-interpreter", f"./{self.loader.debug_name}", "--set-rpath", f"./{self.configs.debug_dir}", self.binary.debug_name])
+            except subprocess.CalledProcessError:
+                print("[!] patchelf failed")
+        else:
+            try:
+                subprocess.check_call(["patchelf", "--set-rpath", f"./{self.configs.debug_dir}", self.binary_name.debug_name])
+            except subprocess.CalledProcessError:
+                print("[!] patchelf failed")

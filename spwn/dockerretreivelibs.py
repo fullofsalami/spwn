@@ -139,7 +139,7 @@ class DockerAnalyzer:
                 self.tars.update({path:tar_object})
 
             with tarfile.open(fileobj=tar_object) as tar:
-                hits = [*filter(lambda member: member_name in member.name, tar.getmembers())]
+                hits = [member for member in tar.getmembers()]
                 if hits: 
                     break
         member = hits[0]
