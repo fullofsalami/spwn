@@ -47,7 +47,7 @@ class FileManager:
             candidates = [candidate for candidate in os.listdir() if platform.architecture(candidate)[1] == "ELF" and not (candidate.startswith('lib') or candidate.startswith('ld-'))]
             return utils.ask_list('Please chose the binary: ', candidates, False)
 
-        entrys = ''.join(self.image.attrs['ContainerConfig']['Cmd'] + self.image.attrs['ContainerConfig']['Entrypoint'])
+        entrys = ''.join((self.image.attrs['Config']['Cmd'] or []) + (self.image.attrs['Config']['Entrypoint'] or []))
 
         for file in os.listdir():
             if file in entrys:
